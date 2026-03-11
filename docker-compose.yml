@@ -1,0 +1,15 @@
+services:
+  web:
+    build: .
+    image: ipam_light:1.6.0
+    container_name: ipam_light
+    volumes:
+      - ./www:/var/www/html
+      # Le vendor/ est buildé dans l'image — ne pas l'écraser avec le volume
+      - vendor_data:/var/www/html/vendor
+    ports:
+      - "5000:80"
+    restart: unless-stopped
+
+volumes:
+  vendor_data:

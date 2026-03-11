@@ -1,0 +1,29 @@
+# --- PHP & Dependencies ---
+# On ne versionne pas les dépendances, Composer les réinstalle
+www/vendor/
+.phpunit.result.cache
+
+# --- Database & Sensitive Data ---
+# Ta base de données SQLite contient tes mots de passe/utilisateurs
+www/ipam.db
+*.sql
+*.log
+
+# --- Docker ---
+# Si tu as des données persistantes locales pour Docker
+.docker/data/
+
+# --- OS generated files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# --- IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
