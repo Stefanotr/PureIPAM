@@ -157,6 +157,52 @@ try {
     $log[] = "✔ Paramètres politique mot de passe initialisés.";
 
 
+    // ─── MIGRATION v1.8.0 : Groupes de VLANs ────────────────────────────────────
+    $db->exec("CREATE TABLE IF NOT EXISTS vlan_groups (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        name       TEXT UNIQUE NOT NULL,
+        color      TEXT NOT NULL DEFAULT 'primary',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )");
+    $log[] = "✔ Table <code>vlan_groups</code> vérifiée.";
+
+    // Colonne group_id dans vlans
+    $vlanCols = $db->query("PRAGMA table_info(vlans)")->fetchAll(PDO::FETCH_ASSOC);
+    $vlanColNames = array_column($vlanCols, 'name');
+    if (!in_array('group_id', $vlanColNames)) {
+        $db->exec("ALTER TABLE vlans ADD COLUMN group_id INTEGER DEFAULT NULL REFERENCES vlan_groups(id) ON DELETE SET NULL");
+        $log[] = "✔ Colonne <code>group_id</code> ajoutée à vlans.";
+    }
+    // Colonne notes dans vlans
+    if (!in_array('notes', $vlanColNames)) {
+        $db->exec("ALTER TABLE vlans ADD COLUMN notes TEXT DEFAULT ''");
+        $log[] = "✔ Colonne <code>notes</code> ajoutée à vlans.";
+    }
+
+    // ─── MIGRATION v1.8.0 : Historique des IPs ───────────────────────────────────
+    $db->exec("CREATE TABLE IF NOT EXISTS ip_history (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ip_id       INTEGER NOT NULL,
+        ip_address  TEXT NOT NULL,
+        vlan_id     INTEGER NOT NULL,
+        field       TEXT NOT NULL,
+        old_value   TEXT NOT NULL DEFAULT '',
+        new_value   TEXT NOT NULL DEFAULT '',
+        changed_by  TEXT NOT NULL DEFAULT 'system',
+        changed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+    )");
+    $log[] = "✔ Table <code>ip_history</code> vérifiée.";
+
+    // ─── MIGRATION v1.8.0 : Rétention audit ─────────────────────────────────────
+    $auditDefaults = [
+        'audit_retention_days' => '0',  // 0 = indéfini
+    ];
+    $ins2 = $db->prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)");
+    foreach ($auditDefaults as $k => $v) {
+        $ins2->execute([$k, $v]);
+    }
+    $log[] = "✔ Paramètre rétention audit initialisé.";
+
     // ─── TABLE TAGS ─────────────────────────────────────────────────────────────
     $db->exec("CREATE TABLE IF NOT EXISTS tags (
         id    INTEGER PRIMARY KEY AUTOINCREMENT,

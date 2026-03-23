@@ -25,9 +25,12 @@ if (isset($_POST['add_vlan'])) {
         redirect('index.php', "Subnet invalide : $subCheck", 'danger');
     }
 
+    $groupId = (int)($_POST['group_id'] ?? 0) ?: null;
+    $notes   = trim($_POST['notes'] ?? '');
     try {
-        $db->prepare("INSERT INTO vlans (vid, name, subnet, description, updated_at) VALUES (?,?,?,?,CURRENT_TIMESTAMP)")
-           ->execute([$vid, $name, $sub, $desc]);
+        $db->prepare("INSERT INTO vlans (vid, name, subnet, description, group_id, notes, updated_at) VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP)")
+           ->execute([$vid, $name, $sub, $desc, $groupId, $notes]);
+        audit('vlan.create', "VLAN $vid", "name:$name subnet:$sub");
         redirect('index.php', "VLAN $vid — $name créé avec succès.");
     } catch (Exception $e) {
         redirect('index.php', "Erreur : le VID $vid existe peut-être déjà.", 'danger');
@@ -51,9 +54,12 @@ if (isset($_POST['edit_vlan'])) {
         redirect('index.php', "Subnet invalide : $subCheck", 'danger');
     }
 
+    $groupId = (int)($_POST['group_id'] ?? 0) ?: null;
+    $notes   = trim($_POST['notes'] ?? '');
     try {
-        $db->prepare("UPDATE vlans SET vid=?, name=?, subnet=?, description=?, updated_at=CURRENT_TIMESTAMP WHERE id=?")
-           ->execute([$vid, $name, $sub, $desc, $id]);
+        $db->prepare("UPDATE vlans SET vid=?, name=?, subnet=?, description=?, group_id=?, notes=?, updated_at=CURRENT_TIMESTAMP WHERE id=?")
+           ->execute([$vid, $name, $sub, $desc, $groupId, $notes, $id]);
+        audit('vlan.update', "VLAN $vid", "name:$name");
         redirect('index.php', "VLAN mis à jour.");
     } catch (Exception $e) {
         redirect('index.php', "Erreur lors de la mise à jour.", 'danger');

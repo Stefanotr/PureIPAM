@@ -187,7 +187,94 @@ if (isset($_POST['save_pw_policy'])) {
     foreach (['pw_min_length'=>$pwMin,'pw_max_length'=>$pwMax,'pw_complexity'=>$pwCplx,'pw_expiry_days'=>$pwExp] as $k=>$v)
         $upd->execute([$k, (string)$v]);
     audit('settings.pw_policy','security',"min:{$pwMin} max:{$pwMax} complexity:{$pwCplx} expiry:{$pwExp}");
-    redirect('settings.php?tab=security', '✅ Politique de mot de passe sauvegardée.');
+    redirect('settings.php?tab=security', te('pw.saved'));
+}
+
+// ─── AUDIT : Export CSV ───────────────────────────────────────────────────────
+if (isset($_GET['export_audit']) && $_GET['export_audit'] === 'csv') {
+    $rows = $db->query("SELECT * FROM audit_log ORDER BY created_at DESC")->fetchAll();
+    audit('audit.export', $_SESSION['user'], 'Export CSV journal d'audit');
+    header('Content-Type: text/csv; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="audit_log_' . date('Ymd_His') . '.csv"');
+    $out = fopen('php://output', 'w');
+    fprintf($out, chr(0xEF).chr(0xBB).chr(0xBF));
+    fputcsv($out, ['ID','Date','Utilisateur','Action','Cible','Détail','IP Source'], ';');
+    foreach ($rows as $r) fputcsv($out, [$r['id'],$r['created_at'],$r['username'],$r['action'],$r['target'],$r['detail'],$r['ip_address']], ';');
+    fclose($out); exit;
+}
+
+// ─── AUDIT : Export JSON ──────────────────────────────────────────────────────
+if (isset($_GET['export_audit']) && $_GET['export_audit'] === 'json') {
+    $rows = $db->query("SELECT * FROM audit_log ORDER BY created_at DESC")->fetchAll();
+    audit('audit.export', $_SESSION['user'], 'Export JSON journal d'audit');
+    header('Content-Type: application/json; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="audit_log_' . date('Ymd_His') . '.json"');
+    echo json_encode(['exported_at' => date('c'), 'total' => count($rows), 'entries' => $rows], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// ─── AUDIT : Purge / Rétention ────────────────────────────────────────────────
+if (isset($_POST['save_audit_retention'])) {
+    csrfVerify();
+    $days = max(0, (int)($_POST['audit_retention_days'] ?? 0));
+    $db->prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('audit_retention_days', ?)")->execute([(string)$days]);
+    audit('settings.audit_retention', 'audit', "Rétention définie : {$days} jours");
+    redirect('settings.php?tab=audit', '✅ Rétention des logs sauvegardée.');
+}
+if (isset($_POST['purge_audit'])) {
+    csrfVerify();
+    $days = max(1, (int)($_POST['purge_days'] ?? 30));
+    $stmt = $db->prepare("DELETE FROM audit_log WHERE created_at < datetime('now', '-' || ? || ' days')");
+    $stmt->execute([$days]);
+    $deleted = $db->lastInsertId() ? 0 : 0; // sqlite rowCount workaround
+    $deleted = $stmt->rowCount();
+    audit('audit.purge', $_SESSION['user'], "Purge des logs > {$days}j : {$deleted} supprimés");
+    redirect('settings.php?tab=audit', "✅ {$deleted} entrée(s) supprimée(s).");
+}
+
+// ─── DB : Backup ──────────────────────────────────────────────────────────────
+if (isset($_GET['db_backup'])) {
+    $dbPath = '/var/www/html/ipam.db';
+    if (!file_exists($dbPath)) redirect('settings.php?tab=database','Base de données introuvable.','danger');
+    audit('db.backup', $_SESSION['user'], 'Backup téléchargé');
+    header('Content-Type: application/octet-stream');
+    header('Content-Disposition: attachment; filename="ipam_backup_' . date('Ymd_His') . '.db"');
+    header('Content-Length: ' . filesize($dbPath));
+    readfile($dbPath); exit;
+}
+
+// ─── DB : Restore ─────────────────────────────────────────────────────────────
+if (isset($_POST['db_restore'])) {
+    csrfVerify();
+    if (isset($_FILES['restore_file']) && $_FILES['restore_file']['error'] === 0) {
+        $tmp = $_FILES['restore_file']['tmp_name'];
+        // Vérifier signature SQLite
+        $magic = file_get_contents($tmp, false, null, 0, 16);
+        if (strpos($magic, 'SQLite format 3') === 0) {
+            $dbPath = '/var/www/html/ipam.db';
+            copy($dbPath, $dbPath . '.bak_' . date('Ymd_His'));
+            copy($tmp, $dbPath);
+            audit('db.restore', $_SESSION['user'], 'Base de données restaurée');
+            redirect('settings.php?tab=database', '✅ Base de données restaurée. Un backup de l'ancienne a été créé.');
+        } else {
+            redirect('settings.php?tab=database', '❌ Fichier invalide — ce n'est pas une base SQLite.', 'danger');
+        }
+    }
+    redirect('settings.php?tab=database', '❌ Erreur lors de l'upload.', 'danger');
+}
+
+// ─── DB : Nettoyage orphelins ─────────────────────────────────────────────────
+if (isset($_POST['db_cleanup'])) {
+    csrfVerify();
+    $deleted = 0;
+    // IPs sans VLAN
+    $stmt = $db->prepare("DELETE FROM ips WHERE vlan_id NOT IN (SELECT id FROM vlans)");
+    $stmt->execute(); $deleted += $stmt->rowCount();
+    // Tentatives de login expirées
+    $stmt2 = $db->prepare("DELETE FROM login_attempts WHERE locked_until < datetime('now') AND locked_until IS NOT NULL");
+    $stmt2->execute(); $deleted += $stmt2->rowCount();
+    audit('db.cleanup', $_SESSION['user'], "Nettoyage orphelins : {$deleted} lignes supprimées");
+    redirect('settings.php?tab=database', "✅ Nettoyage terminé — {$deleted} ligne(s) supprimée(s).");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -203,6 +290,13 @@ $allUsers = $db->query("
     LEFT JOIN login_attempts la ON la.username = u.username AND la.ip != 'manual'
     ORDER BY u.role DESC, u.username ASC
 ")->fetchAll();
+
+// ─── Rétention audit ─────────────────────────────────────────────────────────
+$auditRetention = '0';
+try {
+    $r = $db->prepare("SELECT value FROM settings WHERE key='audit_retention_days'");
+    $r->execute(); $auditRetention = $r->fetchColumn() ?: '0';
+} catch(Exception $e) {}
 $lic      = getLicense();
 $demoKey  = generateLicenseKey();
 $themes   = unserialize(IPAM_THEMES);
@@ -299,10 +393,10 @@ if ($tab === 'audit') {
 
 <div class="container py-4" style="max-width:1000px">
     <div class="d-flex align-items-center gap-3 mb-4">
-        <a href="index.php" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-left me-1"></i>Retour</a>
+        <a href="index.php" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-left me-1"></i><?= te('action.back') ?></a>
         <div>
-            <h4 class="mb-0 fw-bold"><i class="bi bi-gear-fill me-2 text-primary"></i>Paramètres</h4>
-            <div class="text-muted small mt-1">Administration système — accès Sysadmin uniquement</div>
+            <h4 class="mb-0 fw-bold"><i class="bi bi-gear-fill me-2 text-primary"></i><?= te('settings.title') ?></h4>
+            <div class="text-muted small mt-1"><?= te('settings.subtitle') ?></div>
         </div>
         <div class="ms-auto"><span class="badge bg-secondary" style="font-size:.7rem">v<?= APP_VERSION ?> — build <?= APP_BUILD ?></span></div>
     </div>
@@ -323,12 +417,12 @@ if ($tab === 'audit') {
         <li class="nav-item">
             <a class="nav-link <?= $tab==='license'?'active':'' ?>" href="?tab=license">
                 <i class="bi bi-patch-check-fill me-1"></i><?= te('settings.tab.license') ?>
-                <span class="badge <?= $lic?'bg-success':'bg-warning text-dark' ?> ms-1" style="font-size:.65rem"><?= $lic?'Active':'Inactive' ?></span>
+                <span class="badge <?= $lic?'bg-success':'bg-warning text-dark' ?> ms-1" style="font-size:.65rem"><?= $lic ? te('lic.active') : te('lic.none') ?></span>
             </a>
         </li>
         <li class="nav-item">
             <a class="nav-link <?= $tab==='site'?'active':'' ?>" href="?tab=site">
-                <i class="bi bi-sliders me-1"></i>Site
+                <i class="bi bi-sliders me-1"></i><?= te('settings.tab.site') ?>
             </a>
         </li>
         <li class="nav-item">
@@ -357,29 +451,29 @@ if ($tab === 'audit') {
     <!-- Créer un utilisateur -->
     <div class="card border-0 bg-light mb-4">
         <div class="card-body py-3">
-            <h6 class="fw-semibold mb-3"><i class="bi bi-person-plus-fill me-2 text-success"></i>Créer un utilisateur</h6>
+            <h6 class="fw-semibold mb-3"><i class="bi bi-person-plus-fill me-2 text-success"></i><?= te('user.create_title') ?></h6>
             <form method="POST" class="row g-2 align-items-end">
                 <?= csrfField() ?>
                 <div class="col-md-4">
-                    <label class="form-label small mb-1">Nom d'utilisateur <span class="text-danger">*</span></label>
+                    <label class="form-label small mb-1"><?= te('user.username') ?> <span class="text-danger">*</span></label>
                     <input type="text" name="new_u" class="form-control form-control-sm" placeholder="ex: jean.dupont" required minlength="3" maxlength="64">
                 </div>
                 <div class="col-md-3">
-                    <label class="form-label small mb-1">Mot de passe <span class="text-danger">*</span></label>
-                    <input type="password" name="new_p" class="form-control form-control-sm" placeholder="Min 4 car." required minlength="4" maxlength="64">
+                    <label class="form-label small mb-1"><?= te('user.password') ?> <span class="text-danger">*</span></label>
+                    <input type="password" name="new_p" class="form-control form-control-sm" placeholder="<?= te('user.min_pw_chars') ?>" required minlength="4" maxlength="64">
                 </div>
                 <div class="col-md-3">
-                    <label class="form-label small mb-1">Rôle</label>
+                    <label class="form-label small mb-1"><?= te('user.role') ?></label>
                     <select name="new_r" class="form-select form-select-sm">
-                        <option value="viewer">Viewer — lecture seule</option>
-                        <option value="admin">Admin — VLANs + IPs</option>
-                        <option value="sysadmin">Sysadmin — accès total</option>
+                        <option value="viewer"><?= te('role.viewer') ?></option>
+                        <option value="admin"><?= te('role.admin') ?></option>
+                        <option value="sysadmin"><?= te('role.sysadmin') ?></option>
                     </select>
                 </div>
                 <div class="col-md-2">
                     <div class="form-check form-switch mb-1">
                         <input class="form-check-input" type="checkbox" name="new_must_change" id="newMustChange" checked>
-                        <label class="form-check-label small" for="newMustChange">Forcer chgt mdp</label>
+                        <label class="form-check-label small" for="newMustChange"><?= te('user.force_pw') ?></label>
                     </div>
                     <button type="submit" name="add_user" class="btn btn-success btn-sm w-100"><i class="bi bi-plus-lg me-1"></i>Créer</button>
                 </div>
@@ -392,12 +486,12 @@ if ($tab === 'audit') {
         <table class="table table-hover align-middle mb-0" style="font-size:.88rem">
             <thead class="table-dark">
                 <tr>
-                    <th>Utilisateur</th>
-                    <th>Rôle</th>
-                    <th style="width:80px">2FA</th>
-                    <th style="width:100px">Statut</th>
-                    <th style="width:90px">Créé le</th>
-                    <th style="width:160px" class="text-end pe-2">Actions</th>
+                    <th><?= te('user.username') ?></th>
+                    <th><?= te('user.role') ?></th>
+                    <th style="width:80px"><?= te('user.2fa') ?></th>
+                    <th style="width:100px"><?= te('user.status') ?></th>
+                    <th style="width:90px"><?= te('user.created_at') ?></th>
+                    <th style="width:160px" class="text-end pe-2"><?= te('vlan.actions') ?></th>
                 </tr>
             </thead>
             <tbody>
@@ -413,7 +507,7 @@ if ($tab === 'audit') {
                 <td class="fw-semibold">
                     <?= e($u['username']) ?>
                     <?php if ($isMe): ?>
-                        <span class="badge bg-secondary ms-1" style="font-size:.6rem">vous</span>
+                        <span class="badge bg-secondary ms-1" style="font-size:.6rem"><?= siteLang()==='fr'?'vous':'you' ?></span>
                     <?php endif; ?>
                     <?php if (!empty($u['must_change_password'])): ?>
                         <span class="badge bg-warning text-dark ms-1" style="font-size:.6rem" title="Doit changer son mot de passe"><i class="bi bi-key-fill"></i></span>
@@ -426,22 +520,22 @@ if ($tab === 'audit') {
                 <!-- 2FA -->
                 <td>
                     <?php if ($u['google_2fa_secret']): ?>
-                        <span class="badge bg-success" style="font-size:.7rem"><i class="bi bi-shield-check me-1"></i>Actif</span>
+                        <span class="badge bg-success" style="font-size:.7rem"><i class="bi bi-shield-check me-1"></i><?= te('user.2fa.active') ?></span>
                     <?php else: ?>
-                        <span class="badge bg-light text-muted border" style="font-size:.7rem"><i class="bi bi-shield-slash me-1"></i>Non</span>
+                        <span class="badge bg-light text-muted border" style="font-size:.7rem"><i class="bi bi-shield-slash me-1"></i><?= te('user.2fa.inactive') ?></span>
                     <?php endif; ?>
                 </td>
 
                 <!-- Statut -->
                 <td>
                     <?php if ($isMe): ?>
-                        <span class="badge bg-success" style="font-size:.7rem"><i class="bi bi-circle-fill me-1"></i>Connecté</span>
+                        <span class="badge bg-success" style="font-size:.7rem"><i class="bi bi-circle-fill me-1"></i><?= te('user.status.connected') ?></span>
                     <?php elseif ($isManualLocked): ?>
-                        <span class="badge bg-danger" style="font-size:.7rem"><i class="bi bi-lock-fill me-1"></i>Bloqué</span>
+                        <span class="badge bg-danger" style="font-size:.7rem"><i class="bi bi-lock-fill me-1"></i><?= te('user.status.locked') ?></span>
                     <?php elseif ($isRateLocked): ?>
                         <span class="badge bg-warning text-dark" style="font-size:.7rem"><i class="bi bi-hourglass-split me-1"></i><?= $remMin ?>min</span>
                     <?php else: ?>
-                        <span class="badge bg-light text-muted border" style="font-size:.7rem"><i class="bi bi-check-circle me-1"></i>Actif</span>
+                        <span class="badge bg-light text-muted border" style="font-size:.7rem"><i class="bi bi-check-circle me-1"></i><?= te('user.status.active') ?></span>
                     <?php endif; ?>
                 </td>
 
@@ -459,12 +553,12 @@ if ($tab === 'audit') {
                                 <i class="bi bi-qr-code"></i>
                             </button>
                             <!-- Désactiver 2FA -->
-                            <a href="?disable_2fa=<?= $u['id'] ?>&tab=users"
-                               class="btn btn-outline-secondary"
-                               onclick="return confirm('Désactiver la 2FA de <?= e($u['username']) ?> ?')"
-                               title="Désactiver 2FA">
+                            <button class="btn btn-outline-secondary"
+                                    data-bs-toggle="modal"
+                                    data-bs-target="#modalDis2fa<?= $u['id'] ?>"
+                                    title="<?= te('user.2fa.disable_title') ?>">
                                 <i class="bi bi-shield-x"></i>
-                            </a>
+                            </button>
                         <?php else: ?>
                             <!-- Activer 2FA -->
                             <a href="?setup_2fa=<?= $u['id'] ?>&tab=users"
@@ -487,23 +581,31 @@ if ($tab === 'audit') {
                             <!-- Bloquer / Débloquer -->
                             <?php if ($isLocked): ?>
                                 <a href="?unlock_user=<?= $u['id'] ?>&tab=users"
-                                   class="btn btn-outline-success" title="Débloquer">
+                                   class="btn btn-outline-success" title="<?= te('user.unlock_title') ?>">
                                     <i class="bi bi-unlock-fill"></i>
                                 </a>
                             <?php else: ?>
-                                <a href="?lock_user=<?= $u['id'] ?>&tab=users"
-                                   class="btn btn-outline-danger"
-                                   onclick="return confirm('Bloquer <?= e($u['username']) ?> ?')"
-                                   title="Bloquer">
+                                <button class="btn btn-outline-danger"
+                                        data-bs-toggle="modal"
+                                        data-bs-target="#modalLock<?= $u['id'] ?>"
+                                        title="<?= te('user.lock_title') ?>">
                                     <i class="bi bi-lock-fill"></i>
+                                </button>
+                            <?php endif; ?>
+                            <?php if ($isRateLocked && !$isManualLocked): ?>
+                                <a href="?unlock_user=<?= $u['id'] ?>&tab=users"
+                                   class="btn btn-outline-warning btn-sm"
+                                   title="Lever le blocage auto (<?= $remMin ?>min)">
+                                    <i class="bi bi-hourglass"></i>
                                 </a>
                             <?php endif; ?>
                             <!-- Supprimer -->
-                            <a href="?delete=<?= $u['id'] ?>&tab=users"
-                               class="btn btn-outline-danger"
-                               onclick="return confirm('Supprimer définitivement « <?= e($u['username']) ?> » ?')">
+                            <button class="btn btn-outline-danger"
+                                    data-bs-toggle="modal"
+                                    data-bs-target="#modalDelete<?= $u['id'] ?>"
+                                    title="<?= te('user.delete_title') ?>">
                                 <i class="bi bi-trash"></i>
-                            </a>
+                            </button>
                         <?php endif; ?>
                     </div>
                 </td>
@@ -556,12 +658,12 @@ if ($tab === 'audit') {
                         </div>
                         <div class="modal-body">
                             <input type="password" name="admin_pw" class="form-control form-control-sm mb-3"
-                                   placeholder="Min 4 caractères" required minlength="4" maxlength="64" autofocus>
+                                   placeholder="<?= te('user.min_pw_chars') ?>" required minlength="4" maxlength="64" autofocus>
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" name="must_change"
                                        id="mc<?= $u['id'] ?>" checked>
                                 <label class="form-check-label small" for="mc<?= $u['id'] ?>">
-                                    Forcer le changement à la connexion
+                                    <?= te('user.must_change') ?>
                                 </label>
                             </div>
                         </div>
@@ -593,10 +695,72 @@ if ($tab === 'audit') {
                         </div>
                         <div class="modal-footer p-2">
                             <button type="submit" name="change_role" class="btn btn-warning btn-sm w-100">
-                                <i class="bi bi-floppy me-1"></i>Mettre à jour
+                                <i class="bi bi-floppy me-1"></i><?= te('action.save') ?>
                             </button>
                         </div>
                     </form>
+                </div></div>
+            </div>
+            <?php endif; ?>
+
+            <!-- ── MODALS CONFIRMATION (nouveaux v1.8) ──────────────────── -->
+
+            <!-- Modal Désactiver 2FA -->
+            <?php if ($u['google_2fa_secret']): ?>
+            <div class="modal fade" id="modalDis2fa<?= $u['id'] ?>" tabindex="-1">
+                <div class="modal-dialog modal-sm"><div class="modal-content">
+                    <div class="modal-header py-2 border-0">
+                        <h6 class="modal-title fw-semibold"><i class="bi bi-shield-x me-2 text-warning"></i><?= te('user.2fa.disable_title') ?></h6>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body pt-0">
+                        <p class="mb-1"><?= str_replace('{user}', '<strong>'.e($u['username']).'</strong>', te('user.2fa.disable_confirm')) ?></p>
+                        <div class="alert alert-warning py-2 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i><?= te('user.2fa.disable_warning') ?></div>
+                    </div>
+                    <div class="modal-footer py-2 gap-2">
+                        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal"><?= te('action.cancel') ?></button>
+                        <a href="?disable_2fa=<?= $u['id'] ?>&tab=users" class="btn btn-sm btn-warning"><?= te('action.yes_disable') ?></a>
+                    </div>
+                </div></div>
+            </div>
+            <?php endif; ?>
+
+            <!-- Modal Bloquer user -->
+            <?php if (!$isMe && !$isManualLocked): ?>
+            <div class="modal fade" id="modalLock<?= $u['id'] ?>" tabindex="-1">
+                <div class="modal-dialog modal-sm"><div class="modal-content">
+                    <div class="modal-header py-2 border-0">
+                        <h6 class="modal-title fw-semibold"><i class="bi bi-lock-fill me-2 text-danger"></i><?= te('user.lock_title') ?></h6>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body pt-0">
+                        <p class="mb-1"><?= str_replace('{user}', '<strong>'.e($u['username']).'</strong>', te('user.lock_confirm')) ?></p>
+                        <div class="alert alert-danger py-2 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i><?= te('user.lock_warning') ?></div>
+                    </div>
+                    <div class="modal-footer py-2 gap-2">
+                        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal"><?= te('action.cancel') ?></button>
+                        <a href="?lock_user=<?= $u['id'] ?>&tab=users" class="btn btn-sm btn-danger"><?= te('action.yes_lock') ?></a>
+                    </div>
+                </div></div>
+            </div>
+            <?php endif; ?>
+
+            <!-- Modal Supprimer user -->
+            <?php if (!$isMe): ?>
+            <div class="modal fade" id="modalDelete<?= $u['id'] ?>" tabindex="-1">
+                <div class="modal-dialog modal-sm"><div class="modal-content">
+                    <div class="modal-header py-2 border-0">
+                        <h6 class="modal-title fw-semibold"><i class="bi bi-trash me-2 text-danger"></i><?= te('user.delete_title') ?></h6>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body pt-0">
+                        <p class="mb-1"><?= str_replace('{user}', '<strong>'.e($u['username']).'</strong>', te('user.delete_confirm')) ?></p>
+                        <div class="alert alert-danger py-2 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i><?= te('user.delete_warning') ?></div>
+                    </div>
+                    <div class="modal-footer py-2 gap-2">
+                        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal"><?= te('action.cancel') ?></button>
+                        <a href="?delete=<?= $u['id'] ?>&tab=users" class="btn btn-sm btn-danger"><?= te('action.yes_delete') ?></a>
+                    </div>
                 </div></div>
             </div>
             <?php endif; ?>
@@ -628,9 +792,27 @@ if ($tab === 'audit') {
                         <hr class="my-2">
                         <div class="d-flex align-items-center gap-2 flex-wrap">
                             <code class="small user-select-all flex-grow-1"><?= e($lic['key']) ?></code>
-                            <a href="?revoke_license=1&tab=license" class="btn btn-sm btn-outline-danger" onclick="return confirm('Révoquer la licence ?')"><i class="bi bi-x-circle me-1"></i>Révoquer</a>
+                            <button class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#modalRevokeLic"><i class="bi bi-x-circle me-1"></i><?= te('lic.revoke') ?></button>
                         </div>
                     <?php endif; ?>
+
+<!-- Modal révoquer licence -->
+<div class="modal fade" id="modalRevokeLic" tabindex="-1">
+    <div class="modal-dialog modal-sm"><div class="modal-content">
+        <div class="modal-header py-2 border-0">
+            <h6 class="modal-title fw-semibold"><i class="bi bi-x-circle me-2 text-danger"></i><?= te('lic.revoke_title') ?></h6>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body pt-0">
+            <p class="mb-1"><?= te('lic.revoke_confirm') ?></p>
+            <div class="alert alert-danger py-2 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i><?= te('lic.revoke_warning') ?></div>
+        </div>
+        <div class="modal-footer py-2 gap-2">
+            <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal"><?= te('action.cancel') ?></button>
+            <a href="?revoke_license=1&tab=license" class="btn btn-sm btn-danger"><?= te('action.yes_revoke') ?></a>
+        </div>
+    </div></div>
+</div>
                 </div>
             </div>
         </div>
@@ -777,77 +959,241 @@ if ($tab === 'audit') {
     </form>
 
     <?php elseif($tab==='database'): ?>
-    <!-- ══ BASE DE DONNÉES ═══════════════════════════════════════════════════ -->
-    <div class="alert alert-warning d-flex gap-3 align-items-start">
-        <i class="bi bi-exclamation-triangle-fill fs-4 flex-shrink-0 mt-1"></i>
-        <div>
-            <strong>Accès restreint Sysadmin</strong><br>
-            <span class="small">La migration de base de données est une opération sensible. Elle est exécutée en mémoire et ne supprime aucune donnée existante, mais peut modifier la structure des tables.</span>
+    <!-- ══ BASE DE DONNÉES ═══════════════════════════════════════════════════ --><?php
+$dbPath = '/var/www/html/ipam.db';
+$dbSize = file_exists($dbPath) ? round(filesize($dbPath)/1024,1).'KB' : 'N/A';
+try { $dbTables = db()->query("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")->fetchColumn(); } catch(Exception $e) { $dbTables = '?'; }
+$tableNames = ['users','vlans','ips','tags','license','settings','audit_log','login_attempts','vlan_groups','ip_history'];
+// Stats pour graphiques
+$statsIpStatus = ['used'=>0,'free'=>0,'reserved'=>0];
+$statsVlanIps = []; $statsRoles = []; $statsAudit7d = [];
+try {
+    foreach(['used','free','reserved'] as $st) $statsIpStatus[$st] = (int)db()->query("SELECT COUNT(*) FROM ips WHERE status='$st'")->fetchColumn();
+    $vr = db()->query("SELECT v.name, COUNT(i.id) as cnt FROM vlans v LEFT JOIN ips i ON i.vlan_id=v.id GROUP BY v.id ORDER BY cnt DESC LIMIT 10")->fetchAll();
+    foreach($vr as $r) $statsVlanIps[] = ['name'=>$r['name'],'count'=>(int)$r['cnt']];
+    $rr = db()->query("SELECT role, COUNT(*) as cnt FROM users GROUP BY role")->fetchAll();
+    foreach($rr as $r) $statsRoles[$r['role']] = (int)$r['cnt'];
+    // Activité 7 jours
+    for($d=6;$d>=0;$d--) {
+        $date = date('Y-m-d', strtotime("-{$d} days"));
+        $cnt  = (int)db()->query("SELECT COUNT(*) FROM audit_log WHERE DATE(created_at)='$date'")->fetchColumn();
+        $statsAudit7d[] = ['date'=>date('d/m',strtotime("-{$d} days")),'count'=>$cnt];
+    }
+} catch(Exception $e) {}
+
+// Explorateur de table
+$viewTable  = in_array($_GET['view_table'] ?? '', $tableNames) ? $_GET['view_table'] : null;
+$viewRows   = [];
+if ($viewTable) {
+    try { $viewRows = db()->query("SELECT * FROM $viewTable LIMIT 100")->fetchAll(); } catch(Exception $e) { $viewRows = []; }
+}
+?>
+    <div class="alert alert-warning d-flex gap-3 align-items-start py-2">
+        <i class="bi bi-exclamation-triangle-fill flex-shrink-0 mt-1"></i>
+        <div class="small"><strong><?= te('db.warning_title') ?></strong> — <?= te('db.warning_msg') ?></div>
+    </div>
+
+    <!-- Statistiques rapides -->
+    <div class="row g-3 mb-4">
+        <div class="col-sm-4">
+            <div class="card border-0 bg-light text-center py-3">
+                <div class="text-muted small"><?= te('db.file') ?></div>
+                <code class="small">/var/www/html/ipam.db</code>
+            </div>
+        </div>
+        <div class="col-sm-4">
+            <div class="card border-0 bg-light text-center py-3">
+                <div class="text-muted small"><?= te('db.size') ?></div>
+                <strong><?= $dbSize ?></strong>
+            </div>
+        </div>
+        <div class="col-sm-4">
+            <div class="card border-0 bg-light text-center py-3">
+                <div class="text-muted small"><?= te('db.tables') ?></div>
+                <strong><?= $dbTables ?> tables</strong>
+            </div>
         </div>
     </div>
 
-    <div class="card border-0 db-section bg-light mb-4">
-        <div class="card-body">
-            <h6 class="fw-semibold mb-1"><i class="bi bi-database-gear me-2 text-danger"></i>Migration / Initialisation de la base de données</h6>
-            <p class="text-muted small mb-3">Lance le script <code>db_init.php</code> qui crée les tables manquantes et applique les migrations sans perte de données.</p>
-            <div class="row g-3 mb-3 small">
-                <div class="col-sm-4">
-                    <div class="bg-white border rounded p-2 text-center">
-                        <div class="text-muted">Fichier DB</div>
-                        <code class="small">/var/www/html/ipam.db</code>
-                    </div>
-                </div>
-                <div class="col-sm-4">
-                    <div class="bg-white border rounded p-2 text-center">
-                        <?php
-                            $dbSize = file_exists('/var/www/html/ipam.db') ? round(filesize('/var/www/html/ipam.db')/1024,1).'KB' : 'N/A';
-                        ?>
-                        <div class="text-muted">Taille actuelle</div>
-                        <strong><?= $dbSize ?></strong>
-                    </div>
-                </div>
-                <div class="col-sm-4">
-                    <div class="bg-white border rounded p-2 text-center">
-                        <div class="text-muted">Tables</div>
-                        <?php
-                            try {
-                                $tables = db()->query("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")->fetchColumn();
-                                echo "<strong>$tables tables</strong>";
-                            } catch(Exception $e) { echo '<span class="text-danger">Erreur</span>'; }
-                        ?>
-                    </div>
+    <div class="row g-4">
+    <!-- Col gauche : Migration + Backup + Cleanup -->
+    <div class="col-md-5">
+
+        <!-- Migration -->
+        <div class="card border-0 bg-light mb-3" style="border-left:4px solid #dc3545!important">
+            <div class="card-body p-3">
+                <h6 class="fw-semibold mb-1"><i class="bi bi-database-gear me-2 text-danger"></i><?= te('db.migrate_title') ?></h6>
+                <p class="text-muted small mb-2"><?= te('db.migrate_desc') ?></p>
+                <button class="btn btn-sm btn-danger" data-bs-toggle="modal" data-bs-target="#modalMigrateDB">
+                    <i class="bi bi-database-gear me-1"></i><?= te('db.migrate_btn') ?>
+                </button>
+            </div>
+        </div>
+
+        <!-- Backup -->
+        <div class="card border-0 bg-light mb-3">
+            <div class="card-body p-3">
+                <h6 class="fw-semibold mb-1"><i class="bi bi-download me-2 text-success"></i><?= te('db.backup_title') ?></h6>
+                <p class="text-muted small mb-2"><?= te('db.backup_desc') ?></p>
+                <div class="d-flex gap-2 flex-wrap">
+                    <a href="?tab=database&db_backup=1" class="btn btn-sm btn-success">
+                        <i class="bi bi-download me-1"></i><?= te('db.backup_btn') ?>
+                    </a>
+                    <button class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#modalRestore">
+                        <i class="bi bi-upload me-1"></i><?= te('db.restore_btn') ?>
+                    </button>
                 </div>
             </div>
-            <a href="db_init.php" class="btn btn-danger" onclick="return confirm('Lancer la migration de la base de données ?\n\nCette opération ne supprime aucune donnée mais modifie la structure des tables.')">
-                <i class="bi bi-database-gear me-2"></i>Lancer la migration DB
-            </a>
         </div>
-    </div>
 
-    <div class="card border-0 bg-light">
-        <div class="card-body">
-            <h6 class="fw-semibold mb-3"><i class="bi bi-info-circle me-2 text-primary"></i>État des tables</h6>
-            <div class="table-responsive">
-                <table class="table table-sm align-middle mb-0">
-                    <thead class="table-light"><tr><th>Table</th><th class="text-end">Lignes</th></tr></thead>
+        <!-- Nettoyage -->
+        <div class="card border-0 bg-light mb-3">
+            <div class="card-body p-3">
+                <h6 class="fw-semibold mb-1"><i class="bi bi-stars me-2 text-info"></i><?= te('db.cleanup_title') ?></h6>
+                <p class="text-muted small mb-2"><?= te('db.cleanup_orphans_desc') ?></p>
+                <button class="btn btn-sm btn-outline-info" data-bs-toggle="modal" data-bs-target="#modalCleanup">
+                    <i class="bi bi-trash3 me-1"></i><?= te('db.cleanup_orphans') ?>
+                </button>
+            </div>
+        </div>
+
+        <!-- État des tables -->
+        <div class="card border-0 bg-light">
+            <div class="card-body p-3">
+                <h6 class="fw-semibold mb-2"><i class="bi bi-table me-2 text-primary"></i><?= te('db.tables_state') ?></h6>
+                <table class="table table-sm mb-0" style="font-size:.82rem">
+                    <thead class="table-light"><tr><th><?= te('db.table') ?></th><th class="text-end"><?= te('db.rows') ?></th></tr></thead>
                     <tbody>
-                    <?php
-                    $tableNames = ['users','vlans','ips','tags','license','settings'];
-                    foreach($tableNames as $t):
-                        try {
-                            $count = db()->query("SELECT COUNT(*) FROM $t")->fetchColumn();
-                    ?>
-                        <tr>
-                            <td><code><?= $t ?></code></td>
-                            <td class="text-end"><span class="badge bg-secondary"><?= $count ?></span></td>
-                        </tr>
+                    <?php foreach($tableNames as $t): try { $cnt = db()->query("SELECT COUNT(*) FROM $t")->fetchColumn(); ?>
+                        <tr><td><code><?= $t ?></code></td><td class="text-end"><span class="badge bg-secondary"><?= $cnt ?></span></td></tr>
                     <?php } catch(Exception $e) { ?>
-                        <tr><td><code><?= $t ?></code></td><td class="text-end"><span class="badge bg-light text-muted border">absente</span></td></tr>
+                        <tr><td><code class="text-muted"><?= $t ?></code></td><td class="text-end"><span class="badge bg-light text-muted border"><?= te('db.absent') ?></span></td></tr>
                     <?php } endforeach; ?>
                     </tbody>
                 </table>
             </div>
         </div>
+    </div>
+
+    <!-- Col droite : Graphiques -->
+    <div class="col-md-7">
+        <div class="card border-0 bg-light mb-3">
+            <div class="card-body p-3">
+                <h6 class="fw-semibold mb-3"><i class="bi bi-bar-chart-fill me-2 text-primary"></i><?= te('db.charts_title') ?></h6>
+                <div class="row g-3">
+                    <!-- IPs par statut -->
+                    <div class="col-6">
+                        <p class="text-muted small mb-1 fw-semibold"><?= te('db.chart_ips_status') ?></p>
+                        <canvas id="chartIpStatus" height="140"></canvas>
+                    </div>
+                    <!-- Users par rôle -->
+                    <div class="col-6">
+                        <p class="text-muted small mb-1 fw-semibold"><?= te('db.chart_roles') ?></p>
+                        <canvas id="chartRoles" height="140"></canvas>
+                    </div>
+                    <!-- IPs par VLAN -->
+                    <div class="col-12">
+                        <p class="text-muted small mb-1 fw-semibold"><?= te('db.chart_vlans_ips') ?></p>
+                        <canvas id="chartVlans" height="110"></canvas>
+                    </div>
+                    <!-- Activité audit 7j -->
+                    <div class="col-12">
+                        <p class="text-muted small mb-1 fw-semibold"><?= te('db.chart_audit') ?></p>
+                        <canvas id="chartAudit" height="80"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Explorateur de tables -->
+        <div class="card border-0 bg-light">
+            <div class="card-body p-3">
+                <h6 class="fw-semibold mb-2"><i class="bi bi-search me-2 text-secondary"></i><?= te('db.view_title') ?></h6>
+                <form method="GET" class="d-flex gap-2 mb-3">
+                    <input type="hidden" name="tab" value="database">
+                    <select name="view_table" class="form-select form-select-sm">
+                        <option value=""><?= te('db.view_select') ?></option>
+                        <?php foreach($tableNames as $t): ?>
+                        <option value="<?= $t ?>" <?= $viewTable===$t?'selected':'' ?>><?= $t ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <button type="submit" class="btn btn-sm btn-outline-secondary"><?= te('db.view_btn') ?></button>
+                </form>
+                <?php if ($viewTable && !empty($viewRows)): ?>
+                <div class="table-responsive" style="max-height:250px;overflow-y:auto">
+                    <table class="table table-sm table-bordered mb-0" style="font-size:.72rem">
+                        <thead class="table-dark sticky-top">
+                            <tr><?php foreach(array_keys($viewRows[0]) as $col): ?><th><?= e($col) ?></th><?php endforeach; ?></tr>
+                        </thead>
+                        <tbody>
+                        <?php foreach($viewRows as $row): ?>
+                            <tr><?php foreach($row as $v): ?><td title="<?= e((string)$v) ?>"><?= e(mb_strimwidth((string)$v,0,40,'…')) ?></td><?php endforeach; ?></tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <p class="text-muted small mt-1 mb-0">Affichage limité à 100 lignes.</p>
+                <?php elseif ($viewTable): ?>
+                    <div class="text-muted small text-center py-3">Aucune donnée ou table absente.</div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+    </div>
+
+    <!-- MODALS Base de données -->
+    <div class="modal fade" id="modalMigrateDB" tabindex="-1">
+        <div class="modal-dialog modal-sm"><div class="modal-content">
+            <div class="modal-header py-2 border-0">
+                <h6 class="modal-title fw-semibold"><i class="bi bi-database-gear me-2 text-danger"></i><?= te('db.migrate_title') ?></h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body pt-0">
+                <p class="mb-1"><?= te('db.migrate_confirm') ?></p>
+                <div class="alert alert-warning py-2 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i><?= te('db.migrate_warning') ?></div>
+            </div>
+            <div class="modal-footer py-2 gap-2">
+                <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal"><?= te('action.cancel') ?></button>
+                <a href="db_init.php" class="btn btn-sm btn-danger"><?= te('action.yes_run') ?></a>
+            </div>
+        </div></div>
+    </div>
+
+    <div class="modal fade" id="modalRestore" tabindex="-1">
+        <div class="modal-dialog modal-sm"><div class="modal-content">
+            <form method="POST" enctype="multipart/form-data">
+                <?= csrfField() ?>
+                <div class="modal-header py-2 border-0">
+                    <h6 class="modal-title fw-semibold"><i class="bi bi-upload me-2 text-warning"></i><?= te('db.restore_btn') ?></h6>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body pt-0">
+                    <input type="file" name="restore_file" class="form-control form-control-sm mb-2" accept=".db" required>
+                    <div class="alert alert-danger py-2 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i><?= te('db.restore_warning') ?></div>
+                </div>
+                <div class="modal-footer py-2 gap-2">
+                    <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal"><?= te('action.cancel') ?></button>
+                    <button type="submit" name="db_restore" class="btn btn-sm btn-warning"><?= te('action.yes_restore') ?></button>
+                </div>
+            </form>
+        </div></div>
+    </div>
+
+    <div class="modal fade" id="modalCleanup" tabindex="-1">
+        <div class="modal-dialog modal-sm"><div class="modal-content">
+            <div class="modal-header py-2 border-0">
+                <h6 class="modal-title fw-semibold"><i class="bi bi-stars me-2 text-info"></i><?= te('db.cleanup_title') ?></h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body pt-0">
+                <p class="mb-1"><?= te('db.cleanup_confirm') ?></p>
+                <div class="alert alert-warning py-2 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i><?= te('db.cleanup_warning') ?></div>
+            </div>
+            <div class="modal-footer py-2 gap-2">
+                <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal"><?= te('action.cancel') ?></button>
+                <form method="POST" style="display:inline"><?= csrfField() ?><button type="submit" name="db_cleanup" class="btn btn-sm btn-info text-white"><?= te('action.yes_purge') ?></button></form>
+            </div>
+        </div></div>
     </div>
 
     <?php endif; ?>
@@ -857,39 +1203,49 @@ if ($tab === 'audit') {
     <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
         <h6 class="fw-bold mb-0">
             <i class="bi bi-journal-text me-2 text-primary"></i>
-            Journal d'audit
-            <span class="badge bg-secondary ms-1"><?= number_format($auditTotal) ?></span>
+            <?= te('audit.title') ?>
+            <span class="badge bg-secondary ms-1"><?= number_format($auditTotal) ?> <?= te('audit.entries') ?></span>
         </h6>
-        <form class="d-flex gap-2" method="GET">
-            <input type="hidden" name="tab" value="audit">
-            <input type="text" name="af" class="form-control form-control-sm"
-                   placeholder="Filtrer utilisateur / action…"
-                   value="<?= e($_GET['af'] ?? '') ?>" style="width:220px">
-            <button class="btn btn-sm btn-outline-secondary" type="submit">
-                <i class="bi bi-search"></i>
+        <div class="d-flex gap-2 flex-wrap">
+            <a href="?tab=audit&export_audit=csv" class="btn btn-sm btn-outline-success">
+                <i class="bi bi-filetype-csv me-1"></i><?= te('audit.export_csv') ?>
+            </a>
+            <a href="?tab=audit&export_audit=json" class="btn btn-sm btn-outline-primary">
+                <i class="bi bi-filetype-json me-1"></i><?= te('audit.export_json') ?>
+            </a>
+            <button class="btn btn-sm btn-outline-warning" data-bs-toggle="modal" data-bs-target="#modalAuditRetention">
+                <i class="bi bi-clock-history me-1"></i><?= te('audit.retention_title') ?>
+                <?php if ($auditRetention > 0): ?><span class="badge bg-warning text-dark"><?= $auditRetention ?>j</span><?php endif; ?>
             </button>
-            <?php if (!empty($_GET['af'])): ?>
-                <a href="?tab=audit" class="btn btn-sm btn-outline-danger"><i class="bi bi-x"></i></a>
-            <?php endif; ?>
-        </form>
+        </div>
     </div>
+    <form class="d-flex gap-2 mb-3" method="GET">
+        <input type="hidden" name="tab" value="audit">
+        <input type="text" name="af" class="form-control form-control-sm"
+               placeholder="<?= te('audit.filter') ?>"
+               value="<?= e($_GET['af'] ?? '') ?>" style="max-width:280px">
+        <button class="btn btn-sm btn-outline-secondary" type="submit"><i class="bi bi-search"></i></button>
+        <?php if (!empty($_GET['af'])): ?>
+            <a href="?tab=audit" class="btn btn-sm btn-outline-danger"><i class="bi bi-x"></i></a>
+        <?php endif; ?>
+    </form>
 
     <?php if (empty($auditLogs)): ?>
         <div class="text-center text-muted py-5">
             <i class="bi bi-journal-x" style="font-size:2.5rem;opacity:.3"></i>
-            <p class="mt-2 small">Aucune entrée dans le journal.</p>
+            <p class="mt-2 small"><?= te('audit.empty') ?></p>
         </div>
     <?php else: ?>
     <div class="table-responsive">
         <table class="table table-hover table-sm align-middle mb-0" style="font-size:.82rem">
             <thead class="table-dark">
                 <tr>
-                    <th style="width:145px">Date/Heure</th>
-                    <th style="width:100px">Utilisateur</th>
-                    <th style="width:140px">Action</th>
-                    <th>Cible</th>
-                    <th>Détail</th>
-                    <th style="width:105px">IP Source</th>
+                    <th style="width:145px"><?= te('audit.date') ?></th>
+                    <th style="width:100px"><?= te('audit.user') ?></th>
+                    <th style="width:140px"><?= te('audit.action') ?></th>
+                    <th><?= te('audit.target') ?></th>
+                    <th><?= te('audit.detail') ?></th>
+                    <th style="width:105px"><?= te('audit.ip') ?></th>
                 </tr>
             </thead>
             <tbody>
@@ -933,11 +1289,63 @@ if ($tab === 'audit') {
     </nav>
     <?php endif; ?>
     <?php endif; ?>
+    <!-- Modal Rétention Audit -->
+    <div class="modal fade" id="modalAuditRetention" tabindex="-1">
+        <div class="modal-dialog"><div class="modal-content">
+            <div class="modal-header py-2 border-0">
+                <h6 class="modal-title fw-semibold"><i class="bi bi-clock-history me-2 text-warning"></i><?= te('audit.retention_title') ?></h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form method="POST" id="formRetention">
+                    <?= csrfField() ?>
+                    <p class="text-muted small mb-3"><?= te('audit.retention_label') ?></p>
+                    <div class="d-flex flex-wrap gap-2 mb-3">
+                        <?php foreach([
+                            '30'  => te('audit.retention_30'),
+                            '90'  => te('audit.retention_90'),
+                            '180' => te('audit.retention_180'),
+                            '365' => te('audit.retention_365'),
+                            '0'   => te('audit.retention_forever'),
+                        ] as $val => $label): ?>
+                        <button type="button" class="btn btn-sm <?= $auditRetention==$val ? 'btn-primary' : 'btn-outline-secondary' ?> retention-preset"
+                                data-days="<?= $val ?>"><?= $label ?></button>
+                        <?php endforeach; ?>
+                    </div>
+                    <div class="input-group input-group-sm mb-3">
+                        <span class="input-group-text"><?= te('audit.retention_custom') ?></span>
+                        <input type="number" name="audit_retention_days" id="retentionDays"
+                               class="form-control" min="0" max="3650"
+                               value="<?= (int)$auditRetention ?>">
+                        <span class="input-group-text">jours (0 = indéfini)</span>
+                    </div>
+                    <button type="submit" name="save_audit_retention" class="btn btn-sm btn-primary">
+                        <i class="bi bi-floppy me-1"></i><?= te('audit.retention_save') ?>
+                    </button>
+                </form>
+                <hr>
+                <form method="POST">
+                    <?= csrfField() ?>
+                    <p class="small fw-semibold mb-2 text-danger"><i class="bi bi-trash me-1"></i><?= te('audit.purge_btn') ?></p>
+                    <div class="input-group input-group-sm mb-2">
+                        <span class="input-group-text">Purger logs de plus de</span>
+                        <input type="number" name="purge_days" class="form-control" min="1" value="<?= max(1,(int)$auditRetention) ?: 30 ?>">
+                        <span class="input-group-text">jours</span>
+                    </div>
+                    <div class="alert alert-danger py-2 small mb-2"><i class="bi bi-exclamation-triangle me-1"></i><?= te('audit.purge_warning') ?></div>
+                    <button type="submit" name="purge_audit" class="btn btn-sm btn-danger"
+                            onclick="return confirm('<?= te('audit.purge_confirm') ?>')">
+                        <i class="bi bi-trash me-1"></i><?= te('audit.purge_btn') ?>
+                    </button>
+                </form>
+            </div>
+        </div></div>
+    </div>
     <?php endif; // audit ?>
 
     <?php if ($tab === 'security'): ?>
     <!-- ══ SÉCURITÉ ═══════════════════════════════════════════════════════════ -->
-    <h6 class="fw-bold mb-4"><i class="bi bi-shield-lock me-2 text-primary"></i>Politique des mots de passe</h6>
+    <h6 class="fw-bold mb-4"><i class="bi bi-shield-lock me-2 text-primary"></i><?= te('pw.policy') ?></h6>
 
     <form method="POST" class="row g-4">
         <?= csrfField() ?>
@@ -945,27 +1353,27 @@ if ($tab === 'audit') {
         <div class="col-12">
             <div class="card border-0 bg-light">
                 <div class="card-body p-3">
-                    <h6 class="fw-semibold small mb-3"><i class="bi bi-rulers me-1"></i>Longueur</h6>
+                    <h6 class="fw-semibold small mb-3"><i class="bi bi-rulers me-1"></i><?= te('pw.length_section') ?></h6>
                     <div class="row g-3">
                         <div class="col-6">
-                            <label class="form-label small fw-semibold">Minimum</label>
+                            <label class="form-label small fw-semibold"><?= te('pw.min') ?></label>
                             <div class="input-group input-group-sm">
                                 <input type="number" name="pw_min_length" class="form-control"
                                        value="<?= (int)$pwPolicy['pw_min_length'] ?>"
                                        min="1" max="64" required>
                                 <span class="input-group-text">chars</span>
                             </div>
-                            <small class="text-muted">Entre 1 et 64. Sysadmin peut définir des mdp dès 4 chars.</small>
+                            <small class="text-muted"><?= te('pw.min_help') ?></small>
                         </div>
                         <div class="col-6">
-                            <label class="form-label small fw-semibold">Maximum</label>
+                            <label class="form-label small fw-semibold"><?= te('pw.max') ?></label>
                             <div class="input-group input-group-sm">
                                 <input type="number" name="pw_max_length" class="form-control"
                                        value="<?= (int)$pwPolicy['pw_max_length'] ?>"
                                        min="1" max="64" required>
                                 <span class="input-group-text">chars</span>
                             </div>
-                            <small class="text-muted">Maximum absolu du site : 64 caractères.</small>
+                            <small class="text-muted"><?= te('pw.max_help') ?></small>
                         </div>
                     </div>
                 </div>
@@ -976,7 +1384,7 @@ if ($tab === 'audit') {
         <div class="col-12">
             <div class="card border-0 bg-light">
                 <div class="card-body p-3">
-                    <h6 class="fw-semibold small mb-3"><i class="bi bi-shield-check me-1"></i>Complexité</h6>
+                    <h6 class="fw-semibold small mb-3"><i class="bi bi-shield-check me-1"></i><?= te('pw.complexity_section') ?></h6>
                     <div class="d-flex flex-column gap-2">
                         <?php foreach ([
                             0 => ['Aucune',                          'text-muted',   'bi-circle'],
@@ -1002,23 +1410,22 @@ if ($tab === 'audit') {
         <div class="col-12">
             <div class="card border-0 bg-light">
                 <div class="card-body p-3">
-                    <h6 class="fw-semibold small mb-3"><i class="bi bi-clock-history me-1"></i>Expiration</h6>
+                    <h6 class="fw-semibold small mb-3"><i class="bi bi-clock-history me-1"></i><?= te('pw.expiry_section') ?></h6>
                     <div class="row g-3 align-items-end">
                         <div class="col-6">
-                            <label class="form-label small fw-semibold">Durée de validité</label>
+                            <label class="form-label small fw-semibold"><?= te('pw.expiry') ?></label>
                             <div class="input-group input-group-sm">
                                 <input type="number" name="pw_expiry_days" class="form-control"
                                        value="<?= (int)$pwPolicy['pw_expiry_days'] ?>" min="0" max="3650">
                                 <span class="input-group-text">jours</span>
                             </div>
-                            <small class="text-muted"><strong>0</strong> = jamais expirer.</small>
+                            <small class="text-muted"><?= te('pw.expiry_help') ?></small>
                         </div>
                         <div class="col-6 text-muted small">
                             <?php if ((int)$pwPolicy['pw_expiry_days'] > 0): ?>
-                                Les utilisateurs seront forcés de changer leur mdp tous les
-                                <strong><?= (int)$pwPolicy['pw_expiry_days'] ?> jours</strong>.
+                                <?= str_replace('{n}', (string)(int)$pwPolicy['pw_expiry_days'], te('pw.expiry_info')) ?>
                             <?php else: ?>
-                                Les mots de passe n'expirent jamais.
+                                <?= te('pw.expiry.never') ?>
                             <?php endif; ?>
                         </div>
                     </div>
@@ -1027,9 +1434,7 @@ if ($tab === 'audit') {
         </div>
 
         <div class="col-12">
-            <button type="submit" name="save_pw_policy" class="btn btn-primary">
-                <i class="bi bi-floppy me-1"></i>Sauvegarder la politique
-            </button>
+            <button type="submit" name="save_pw_policy" class="btn btn-primary"><i class="bi bi-floppy me-1"></i><?= te('pw.save_policy') ?></button>
         </div>
     </form>
     <?php endif; // security ?>
@@ -1107,6 +1512,59 @@ document.getElementById('siteNameInput')?.addEventListener('input', function() {
     const el = document.getElementById('navName');
     if (el) el.textContent = this.value || '…';
 });
+
+// ── Rétention : presets ───────────────────────────────────────────────────────
+document.querySelectorAll('.retention-preset').forEach(btn => {
+    btn.addEventListener('click', function() {
+        document.querySelectorAll('.retention-preset').forEach(b => {
+            b.classList.remove('btn-primary'); b.classList.add('btn-outline-secondary');
+        });
+        this.classList.remove('btn-outline-secondary'); this.classList.add('btn-primary');
+        document.getElementById('retentionDays').value = this.dataset.days;
+    });
+});
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script>
+// ── Graphiques ────────────────────────────────────────────────────────────────
+const ipStatusData = <?= json_encode(array_values($statsIpStatus ?? [])) ?>;
+const ipStatusLabels = ['Utilisées','Libres','Réservées'];
+const vlanIpsData   = <?= json_encode($statsVlanIps ?? []) ?>;
+const rolesData     = <?= json_encode($statsRoles ?? []) ?>;
+const auditData     = <?= json_encode($statsAudit7d ?? []) ?>;
+const accent        = getComputedStyle(document.documentElement).getPropertyValue('--ipam-accent').trim() || '#0d6efd';
+
+if (document.getElementById('chartIpStatus')) {
+    new Chart('chartIpStatus', { type:'doughnut', data:{
+        labels: ipStatusLabels,
+        datasets:[{data: ipStatusData,
+            backgroundColor:['#dc3545','#198754','#ffc107'],
+            borderWidth:2}]
+    }, options:{plugins:{legend:{position:'bottom',labels:{font:{size:10}}}},cutout:'60%'}});
+}
+if (document.getElementById('chartRoles')) {
+    new Chart('chartRoles', { type:'doughnut', data:{
+        labels: Object.keys(rolesData),
+        datasets:[{data: Object.values(rolesData),
+            backgroundColor:['#6f42c1','#0d6efd','#6c757d'],
+            borderWidth:2}]
+    }, options:{plugins:{legend:{position:'bottom',labels:{font:{size:10}}}},cutout:'60%'}});
+}
+if (document.getElementById('chartVlans') && vlanIpsData.length) {
+    new Chart('chartVlans', { type:'bar', data:{
+        labels: vlanIpsData.map(v=>v.name),
+        datasets:[{label:'IPs',data: vlanIpsData.map(v=>v.count),
+            backgroundColor: accent+'cc', borderRadius:4}]
+    }, options:{plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{stepSize:1}}}}});
+}
+if (document.getElementById('chartAudit') && auditData.length) {
+    new Chart('chartAudit', { type:'line', data:{
+        labels: auditData.map(d=>d.date),
+        datasets:[{label:'Actions',data: auditData.map(d=>d.count),
+            borderColor: accent, backgroundColor: accent+'22',
+            fill:true, tension:.3, pointRadius:3}]
+    }, options:{plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{stepSize:1}}}}});
+}
 </script>
 <?php renderFooterReal(); ?>
 </body>
