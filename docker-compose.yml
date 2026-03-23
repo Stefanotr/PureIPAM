@@ -1,8 +1,8 @@
 services:
   web:
     build: .
-    image: ipam_light:1.6.0
-    container_name: ipam_light
+    image: pureipam:1.8.0
+    container_name: pureipam
     volumes:
       - ./www:/var/www/html
       # Le vendor/ est buildé dans l'image — ne pas l'écraser avec le volume

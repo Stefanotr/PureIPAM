@@ -1,8 +1,28 @@
 <?php
 if (session_status() === PHP_SESSION_NONE) session_start();
 
+// ─── DÉTECTION PREMIER LANCEMENT ─────────────────────────────────────────────
+// Si la DB n'existe pas ou est vide → wizard setup
+define('_DB_PATH', '/var/www/html/ipam.db');
 $_currentPage = basename($_SERVER['PHP_SELF']);
-$_publicPages = ['login.php', 'logout.php', 'license.php', 'login_otp.php'];
+if ($_currentPage !== 'setup.php') {
+    $_needsSetup = false;
+    if (!file_exists(_DB_PATH)) {
+        $_needsSetup = true;
+    } else {
+        try {
+            $_setupDb = new PDO('sqlite:' . _DB_PATH);
+            $_setupDb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            $_needsSetup = (int)$_setupDb->query("SELECT COUNT(*) FROM users")->fetchColumn() === 0;
+        } catch (Throwable $_e) { $_needsSetup = true; }
+    }
+    if ($_needsSetup) {
+        header('Location: setup.php');
+        exit;
+    }
+}
+
+$_publicPages = ['login.php', 'logout.php', 'license.php', 'login_otp.php', 'setup.php'];
 
 // ─── HEADERS SÉCURITÉ ────────────────────────────────────────────────────────
 if (!headers_sent()) {
