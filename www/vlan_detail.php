@@ -72,6 +72,18 @@ if (isset($_GET['ping']) && $isAdmin) {
     exit;
 }
 
+// ─── HISTORIQUE IP (AJAX) ────────────────────────────────────────────────────
+if (isset($_GET['ip_history'])) {
+    header('Content-Type: application/json');
+    $ipId = (int)$_GET['ip_history'];
+    try {
+        $h = $db->prepare("SELECT * FROM ip_history WHERE ip_id=? ORDER BY changed_at DESC LIMIT 50");
+        $h->execute([$ipId]);
+        echo json_encode(['ok'=>true,'rows'=>$h->fetchAll()]);
+    } catch(Exception $e) { echo json_encode(['ok'=>false,'rows',[]]); }
+    exit;
+}
+
 // ─── IMPORT CSV ───────────────────────────────────────────────────────────────
 if ($isAdmin && isset($_POST['import_csv'])) {
     csrfVerify("vlan_detail.php?id=$vlanId");
@@ -161,6 +173,15 @@ if ($isAdmin && isset($_POST['edit_ip'])) {
             try {
                 $db->prepare("UPDATE ips SET ip_address=?, hostname=?, domain=?, tag=?, description=?, status=? WHERE id=? AND vlan_id=?")
                    ->execute([$ip, $host, $dom, $tag, $desc, $status, $ipId, $vlanId]);
+                // Enregistrer les changements dans ip_history
+                $fields = ['ip_address'=>$ip,'hostname'=>$host,'domain'=>$dom,'tag'=>$tag,'description'=>$desc,'status'=>$status];
+                $histStmt = $db->prepare("INSERT INTO ip_history (ip_id,ip_address,vlan_id,field,old_value,new_value,changed_by) VALUES (?,?,?,?,?,?,?)");
+                foreach($fields as $field => $newVal) {
+                    $oldVal = (string)($existingRow[$field] ?? '');
+                    if ($oldVal !== (string)$newVal) {
+                        try { $histStmt->execute([$ipId, $ip, $vlanId, $field, $oldVal, (string)$newVal, $_SESSION['user']]); } catch(Exception $e) {}
+                    }
+                }
                 audit('ip.update', $ip, "VLAN {$vlan['name']} | status:$status host:$host");
                 redirect("vlan_detail.php?id=$vlanId", "IP $ip mise à jour.");
             } catch (Exception $e) {
@@ -242,6 +263,8 @@ function pageUrl(int $p, int $vlanId, string $search, int $per): string {
         .copy-btn { cursor:pointer; opacity:.5; font-size:.8rem; }
         .copy-btn:hover { opacity:1; }
         .ping-dot { width:10px;height:10px;border-radius:50%;display:inline-block; }
+        .spin { animation: spin 1s linear infinite; }
+        @keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
     </style>
 </head>
 <body>
@@ -428,7 +451,15 @@ function pageUrl(int $p, int $vlanId, string $search, int $per): string {
                                     title="<?= te('action.edit') ?>">
                                 <i class="bi bi-pencil"></i>
                             </button>
-                            <!-- Bouton suppression → modal Bootstrap (fini les confirm()) -->
+                            <!-- Bouton historique -->
+                            <button class="btn btn-outline-info"
+                                    onclick="loadIpHistory(<?= $ip['id'] ?>, '<?= e($ip['ip_address']) ?>')"
+                                    data-bs-toggle="modal"
+                                    data-bs-target="#modalIpHistory"
+                                    title="<?= te('ip.history') ?>">
+                                <i class="bi bi-clock-history"></i>
+                            </button>
+                            <!-- Bouton suppression → modal Bootstrap -->
                             <button class="btn btn-outline-danger"
                                     data-bs-toggle="modal"
                                     data-bs-target="#modalDelIp"
@@ -594,9 +625,52 @@ function pageUrl(int $p, int $vlanId, string $search, int $per): string {
 </div>
 <?php endif; ?>
 
+<!-- Modal Historique IP -->
+<div class="modal fade" id="modalIpHistory" tabindex="-1">
+    <div class="modal-dialog modal-lg"><div class="modal-content">
+        <div class="modal-header py-2 border-0">
+            <h6 class="modal-title fw-semibold"><i class="bi bi-clock-history me-2 text-info"></i><?= te('ip.history_title') ?> — <span id="histIpAddr"></span></h6>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body p-0">
+            <div id="histLoading" class="text-center py-4 text-muted"><i class="bi bi-arrow-repeat spin me-2"></i>Chargement…</div>
+            <div id="histContent" class="d-none">
+                <table class="table table-sm table-hover mb-0" style="font-size:.82rem">
+                    <thead class="table-dark"><tr>
+                        <th>Date</th><th>Champ</th><th>Ancienne valeur</th><th>Nouvelle valeur</th><th>Par</th>
+                    </tr></thead>
+                    <tbody id="histBody"></tbody>
+                </table>
+                <p id="histEmpty" class="text-center text-muted py-3 d-none"><?= te('ip.history_empty') ?></p>
+            </div>
+        </div>
+        <div class="modal-footer py-2">
+            <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal"><?= te('action.close') ?></button>
+        </div>
+    </div></div>
+</div>
+
+<!-- Modal Confirmer Suppression IP -->
+<div class="modal fade" id="modalDeleteIp" tabindex="-1">
+    <div class="modal-dialog modal-sm"><div class="modal-content">
+        <div class="modal-header py-2 border-0">
+            <h6 class="modal-title fw-semibold"><i class="bi bi-trash me-2 text-danger"></i><?= te('ip.delete_title') ?></h6>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body pt-0">
+            <p class="mb-1"><?= te('ip.delete_confirm') ?> <strong id="deleteIpAddr"></strong></p>
+            <div class="alert alert-danger py-2 small mb-0"><i class="bi bi-exclamation-triangle me-1"></i><?= te('ip.delete_warning') ?></div>
+        </div>
+        <div class="modal-footer py-2 gap-2">
+            <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal"><?= te('action.cancel') ?></button>
+            <a id="deleteIpLink" href="#" class="btn btn-sm btn-danger"><?= te('action.yes_delete') ?></a>
+        </div>
+    </div></div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-// ─── Modal suppression IP : pré-remplir l'adresse et le lien ─────────────────
+// ─── Modal suppression IP ─────────────────────────────────────────────────────
 document.getElementById('modalDelIp')?.addEventListener('show.bs.modal', function(e) {
     const btn    = e.relatedTarget;
     const ipId   = btn.dataset.ipId;
@@ -604,6 +678,44 @@ document.getElementById('modalDelIp')?.addEventListener('show.bs.modal', functio
     document.getElementById('delIpAddr').textContent = ipAddr;
     document.getElementById('delIpLink').href = `?id=<?= $vlanId ?>&del_ip=${ipId}`;
 });
+
+// ─── Historique IP ────────────────────────────────────────────────────────────
+function loadIpHistory(ipId, ipAddr) {
+    document.getElementById('histIpAddr').textContent = ipAddr;
+    const loading = document.getElementById('histLoading');
+    const content = document.getElementById('histContent');
+    const empty   = document.getElementById('histEmpty');
+    if (loading) loading.classList.remove('d-none');
+    if (content) content.classList.add('d-none');
+    fetch(`?id=<?= $vlanId ?>&ip_history=${ipId}`)
+        .then(r => r.json())
+        .then(data => {
+            if (loading) loading.classList.add('d-none');
+            if (content) content.classList.remove('d-none');
+            const tbody = document.getElementById('histBody');
+            if (!tbody) return;
+            tbody.innerHTML = '';
+            if (!data.rows || data.rows.length === 0) {
+                if (empty) empty.classList.remove('d-none');
+                return;
+            }
+            if (empty) empty.classList.add('d-none');
+            data.rows.forEach(r => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td class="text-muted" style="font-size:.75rem;white-space:nowrap">${r.changed_at}</td>
+                    <td><code class="small">${r.field}</code></td>
+                    <td class="text-danger small">${r.old_value || '<em class=text-muted>vide</em>'}</td>
+                    <td class="text-success small">${r.new_value || '<em class=text-muted>vide</em>'}</td>
+                    <td><span class="badge bg-secondary" style="font-size:.65rem">${r.changed_by}</span></td>`;
+                tbody.appendChild(tr);
+            });
+        })
+        .catch(() => {
+            if (loading) loading.classList.add('d-none');
+            if (content) content.classList.remove('d-none');
+            if (empty) empty.classList.remove('d-none');
+        });
+}
 
 // ─── Ping AJAX ────────────────────────────────────────────────────────────────
 document.querySelectorAll('.ping-indicator').forEach(function(el) {

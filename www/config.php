@@ -5,12 +5,31 @@
 
 // ─── VERSION ─────────────────────────────────────────────────────────────────
 define('APP_NAME',    'IPAM Light');
-define('APP_VERSION', '1.7.0');
+define('APP_VERSION', '1.8.0');
 define('APP_BUILD',   '2026.03.10');
 define('APP_AUTHOR',  'Stefano');
 
 // ─── CHANGELOG ───────────────────────────────────────────────────────────────
 define('APP_CHANGELOG', serialize([
+    [
+        'version' => '1.8.0',
+        'date'    => '2026-03-11',
+        'label'   => 'success',
+        'title'   => 'Interface complète : i18n, modals, audit avancé & nouvelles fonctions IPAM',
+        'changes' => [
+            ['type' => 'new',     'text' => "Traductions complètes FR/EN sur tous les onglets (settings, audit, DB, sécurité, utilisateurs)"],
+            ['type' => 'new',     'text' => "Toutes les confirmations remplacées par des modals Bootstrap (suppression user, désactiver 2FA, lock, révoquer licence, migration DB)"],
+            ['type' => 'new',     'text' => "Journal d'audit : export CSV et JSON, gestion de rétention (présets + saisie libre), purge manuelle"],
+            ['type' => 'new',     'text' => "Onglet Base de données refait : backup/restore SQLite, nettoyage orphelins, explorateur de tables, 4 graphiques Chart.js"],
+            ['type' => 'new',     'text' => "Historique des modifications par IP : chaque changement tracé (ancien/nouveau/auteur)"],
+            ['type' => 'new',     'text' => "Groupes de VLANs : création, assignation et filtrage"],
+            ['type' => 'new',     'text' => "Notes internes par VLAN : champ texte libre dans l'édition"],
+            ['type' => 'new',     'text' => "Statistiques visuelles DB : IPs par statut, top VLANs, utilisateurs par rôle, activité 7 jours"],
+            ['type' => 'new',     'text' => "Tables ip_history et vlan_groups ajoutées en base de données"],
+            ['type' => 'improve', 'text' => "Settings : tous les labels, boutons et messages traduits (aucun texte hardcodé français restant)"],
+            ['type' => 'improve', 'text' => "Onglet audit : filtre + pagination + exports dans une interface claire"],
+        ],
+        ],
     [
         'version' => '1.7.0',
         'date'    => '2026-03-11',
